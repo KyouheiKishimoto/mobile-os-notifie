@@ -1,0 +1,8 @@
+{
+    "name": "os-update-watch",
+    "private": true,
+    "scripts": {
+      "test": "node test/logic.test.js"
+    }
+  }
+  
