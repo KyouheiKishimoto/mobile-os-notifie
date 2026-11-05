@@ -2,7 +2,14 @@
     "name": "os-update-watch",
     "private": true,
     "scripts": {
-      "test": "node test/logic.test.js"
+        "test": "node test/logic.test.js",
+        "login": "clasp login",
+        "push": "clasp push",
+        "pull": "clasp pull",
+        "open": "clasp open"
+    },
+    "devDependencies": {
+        "@google/clasp": "^3.4.1",
+        "@types/google-apps-script": "^2.0.14"
     }
-  }
-  
+}

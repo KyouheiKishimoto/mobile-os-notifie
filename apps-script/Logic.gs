@@ -314,11 +314,151 @@ function slackMention(value) {
   return text;
 }
 
+function displayTitle(title) {
+  return collapseSpace(String(title || "").replace(/\s*\(\d{2}[A-Z][0-9A-Z]*\)/g, ""));
+}
+
+function appleRelease(title) {
+  const match = displayTitle(title).match(/^(iOS|iPadOS)\s+(\d+(?:\.\d+)*)/i);
+  if (!match) return null;
+  return { platform: /^ipados/i.test(match[1]) ? "iPadOS" : "iOS", version: match[2] };
+}
+
+function formatPublished(value) {
+  const date = parsePublished(value);
+  if (!date) return "";
+  const month = date.getUTCMonth() + 1;
+  const day = date.getUTCDate();
+  return date.getUTCFullYear() + "-" + (month < 10 ? "0" : "") + month + "-" + (day < 10 ? "0" : "") + day;
+}
+
+function firstSentence(value) {
+  const text = collapseSpace(value);
+  if (!text) return "";
+  for (let i = 0; i < text.length && i < 180; i++) {
+    const ch = text.charAt(i);
+    if (ch === "。" || ch === "！" || ch === "？") return text.slice(0, i + 1);
+    if (ch !== "." && ch !== "!" && ch !== "?") continue;
+    const next = text.charAt(i + 1);
+    if (next && !/\s/.test(next)) continue;
+    if (ch === "." && /\d/.test(text.charAt(i - 1))) continue;
+    if (i < 12) continue;
+    return text.slice(0, i + 1);
+  }
+  return truncateText(text, 120);
+}
+
+function stripReleaseHeading(value) {
+  let rest = collapseSpace(value);
+  const heading = /^((?:iOS|iPadOS)(?:\s*&\s*(?:iOS|iPadOS))?\s+\d+(?:\.\d+)*(?:\s+Release Notes)?(?:\s+Overview|\s+概要)?)\s*[.。]?\s*/i;
+  for (let n = 0; n < 3; n++) {
+    const match = rest.match(heading);
+    if (!match) break;
+    const removedHeading = /release notes|overview|概要/i.test(match[1]);
+    const tail = collapseSpace(rest.slice(match[0].length));
+    if (!removedHeading && tail) break;
+    rest = tail;
+  }
+  return rest;
+}
+
+function summaryTokens(value) {
+  return String(value || "").toLowerCase().match(/[a-z0-9\u3040-\u30ff\u4e00-\u9fff]+/g) || [];
+}
+
+function addsInformation(sentence, heading) {
+  const known = {};
+  summaryTokens(heading).forEach(function (token) { known[token] = true; });
+  ["ios", "ipados", "android", "release", "notes", "overview", "概要"].forEach(function (token) {
+    known[token] = true;
+  });
+  return summaryTokens(sentence).some(function (token) {
+    if (known[token] || /^\d+$/.test(token) || /^\d{2}[a-z][0-9a-z]+$/.test(token)) return false;
+    return true;
+  });
+}
+
+function substantiveSummary(summary, heading) {
+  const sentence = displayTitle(firstSentence(stripReleaseHeading(summary)));
+  if (!sentence || !addsInformation(sentence, heading)) return "";
+  return sentence;
+}
+
+function groupDigestItems(items) {
+  const groups = [];
+  const indexByVersion = {};
+  (items || []).forEach(function (item) {
+    const release = appleRelease(item && item.title);
+    if (release && indexByVersion[release.version] != null) {
+      groups[indexByVersion[release.version]].items.push(item);
+      return;
+    }
+    const group = { release: release, items: [item] };
+    if (release) indexByVersion[release.version] = groups.length;
+    groups.push(group);
+  });
+  return groups;
+}
+
+function digestHeading(group) {
+  if (group.release) {
+    const platforms = [];
+    group.items.forEach(function (item) {
+      const release = appleRelease(item.title);
+      if (release && platforms.indexOf(release.platform) < 0) platforms.push(release.platform);
+    });
+    platforms.sort(function (a, b) { return (a === "iOS" ? 0 : 1) - (b === "iOS" ? 0 : 1); });
+    return platforms.join(" / ") + " " + group.release.version;
+  }
+  const item = group.items[0] || {};
+  const title = displayTitle(item.title);
+  if (item.os && title.indexOf(String(item.os)) !== 0) return item.os + " / " + title;
+  return title;
+}
+
+function digestDateLabel(group) {
+  const dates = [];
+  group.items.forEach(function (item) {
+    const formatted = formatPublished(item.published);
+    if (formatted && dates.indexOf(formatted) < 0) dates.push(formatted);
+  });
+  dates.sort();
+  if (!dates.length) return "";
+  if (dates.length === 1) return dates[0];
+  return dates[0] + " 〜 " + dates[dates.length - 1];
+}
+
+function digestSummary(group) {
+  const heading = digestHeading(group);
+  let best = "";
+  group.items.forEach(function (item) {
+    const sentence = substantiveSummary(item.summary, heading);
+    if (sentence.length > best.length) best = sentence;
+  });
+  return best;
+}
+
+function digestUrls(group) {
+  const urls = [];
+  let hasNotes = false;
+  group.items.forEach(function (item) {
+    const url = String(item.url || "").trim().replace(/\/$/, "");
+    if (!/^https:\/\//i.test(url)) return;
+    if (/^https:\/\/developer\.apple\.com$/i.test(url)) return;
+    if (/\/documentation\/|release-notes/i.test(url)) hasNotes = true;
+    if (urls.indexOf(url) < 0) urls.push(url);
+  });
+  if (!hasNotes) return urls;
+  return urls.filter(function (url) { return /\/documentation\/|release-notes/i.test(url); });
+}
+
 function buildNoticeText(notice) {
   const item = notice || {};
+  const title = displayTitle(item.title);
+  const subject = item.os && title.indexOf(String(item.os)) !== 0 ? item.os + " / " + title : title;
   const lines = [
     (item.mention ? slackMention(item.mention) + " " : "") + "*" + (item.status || "要確認") + "* " + (item.appName || ""),
-    [item.os, item.title].filter(function (part) { return part; }).join(" / "),
+    subject,
     "",
     "*何が変わったか*",
     item.summary || item.title || "公式ページを確認してください。",
@@ -335,24 +475,103 @@ function buildNoticeText(notice) {
   return lines.join("\n");
 }
 
-function buildDigestText(items, sheetUrl, hasApps) {
-  const list = items || [];
-  const shown = list.slice(0, 15);
-  const lines = [
-    "新しいOS更新が " + list.length + " 件あります。スプレッドシートで、各アプリの判断を入れてください。"
-  ];
-  if (!hasApps) {
-    lines.push("有効なアプリが未登録です。アプリのシートに担当アプリを足すと、次回から判断行が作られます。");
-  }
-  lines.push("");
-  shown.forEach(function (item) {
-    lines.push("• " + [item.os, item.title].filter(function (part) { return part; }).join(" / "));
-    lines.push("  推定観点: " + (item.viewpoints || "キーワード一致なし"));
-    if (item.url) lines.push("  " + item.url);
+function digestGroupLines(group) {
+  const lines = ["• " + digestHeading(group)];
+  const date = digestDateLabel(group);
+  if (date) lines.push("  公開: " + date);
+  const summary = digestSummary(group);
+  if (summary) lines.push("  " + summary);
+  digestUrls(group).forEach(function (url) {
+    lines.push("  " + url);
   });
-  if (list.length > shown.length) {
-    lines.push("", "ほか " + (list.length - shown.length) + " 件はシートを見てください。");
+  return lines;
+}
+
+function digestSectionName(group) {
+  const sample = (group.items && group.items[0]) || {};
+  const os = String(sample.os || "");
+  if (/android/i.test(os)) return "Android";
+  if (/ios|ipados/i.test(os) || group.release) return "iOS";
+  return collapseSpace(os) || "その他";
+}
+
+function digestLayout(items, sheetUrl, hasApps) {
+  const list = items || [];
+  const shown = groupDigestItems(list.slice(0, 15));
+  const intro = ["新しいOS更新が " + list.length + " 件あります。スプレッドシートで、各アプリの判断を入れてください。"];
+  if (!hasApps) {
+    intro.push("有効なアプリが未登録です。アプリのシートに担当アプリを足すと、次回から判断行が作られます。");
   }
-  if (sheetUrl) lines.push("", sheetUrl);
+  const names = [];
+  const byName = {};
+  shown.forEach(function (group) {
+    const name = digestSectionName(group);
+    if (!byName[name]) {
+      byName[name] = [];
+      names.push(name);
+    }
+    byName[name].push(group);
+  });
+  names.sort(function (a, b) {
+    const rank = { "iOS": 0, "Android": 1 };
+    const left = rank[a] == null ? 2 : rank[a];
+    const right = rank[b] == null ? 2 : rank[b];
+    return left - right;
+  });
+  const sections = names.map(function (name) {
+    const lines = [];
+    byName[name].forEach(function (group) {
+      digestGroupLines(group).forEach(function (line) { lines.push(line); });
+    });
+    return { name: name, text: lines.join("\n") };
+  });
+  const footer = [];
+  if (list.length > 15) footer.push("ほか " + (list.length - 15) + " 件はシートを見てください。");
+  if (sheetUrl) footer.push("スプレッドシート\n\n" + sheetUrl);
+  return { intro: intro.join("\n"), sections: sections, footer: footer.join("\n") };
+}
+
+function slackSection(text) {
+  return { type: "section", text: { type: "mrkdwn", text: text } };
+}
+
+function slackTextBlocks(text) {
+  const blocks = [];
+  let rest = String(text || "");
+  while (rest.length > 2900) {
+    let cut = rest.lastIndexOf("\n", 2900);
+    if (cut < 500) cut = 2900;
+    blocks.push(slackSection(rest.slice(0, cut)));
+    rest = rest.slice(cut).replace(/^\n+/, "");
+  }
+  if (rest) blocks.push(slackSection(rest));
+  return blocks;
+}
+
+function buildDigestText(items, sheetUrl, hasApps) {
+  const layout = digestLayout(items, sheetUrl, hasApps);
+  const lines = [layout.intro, ""];
+  layout.sections.forEach(function (section) {
+    lines.push("*" + section.name + "*");
+    lines.push(section.text);
+    lines.push("");
+  });
+  if (layout.footer) lines.push("", layout.footer);
   return lines.join("\n");
+}
+
+function buildDigestBlocks(items, sheetUrl, hasApps) {
+  const layout = digestLayout(items, sheetUrl, hasApps);
+  const blocks = slackTextBlocks(layout.intro);
+  layout.sections.forEach(function (section) {
+    blocks.push({ type: "divider" });
+    slackTextBlocks("*" + section.name + "*\n" + section.text).forEach(function (block) {
+      blocks.push(block);
+    });
+  });
+  if (layout.footer) {
+    blocks.push({ type: "divider" });
+    slackTextBlocks(layout.footer).forEach(function (block) { blocks.push(block); });
+  }
+  return blocks;
 }

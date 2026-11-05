@@ -94,6 +94,7 @@ function checkUpdates() {
   withLock(function () {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
     requireSetup(ss);
+    ensureWorkbook(ss);
     const settings = readSettings(ss);
     const rules = readRules(ss);
     const seen = seenMap(ss);
@@ -333,11 +334,19 @@ function sendDigest(ss, settings) {
     return 0;
   }
   const batch = pending.slice(0, 15);
-  const text = buildDigestText(batch.map(function (row) {
-    return { os: row["OS"], title: row["タイトル"], viewpoints: row["推定観点"], url: row["URL"] };
-  }), ss.getUrl(), enabledApps(ss).length > 0);
+  const digestItems = batch.map(function (row) {
+    return {
+      os: row["OS"],
+      title: row["タイトル"],
+      published: row["公開日"],
+      summary: row["公式要約"],
+      url: row["URL"]
+    };
+  });
+  const text = buildDigestText(digestItems, ss.getUrl(), enabledApps(ss).length > 0);
+  const blocks = buildDigestBlocks(digestItems, ss.getUrl(), enabledApps(ss).length > 0);
   try {
-    postSlack(settings.webhook, text);
+    postSlack(settings.webhook, text, blocks);
   } catch (error) {
     logLine(ss, "エラー", "未判断の知らせに失敗しました。次回やり直します。 " + errorMessage(error));
     return 0;
@@ -446,16 +455,45 @@ function remember(seen, rows, id) {
   rows.push({ "ID": id });
 }
 
+function ensureWorkbook(ss) {
+  ensureSheet(ss, SHEET_NAME.settings, HEADERS.settings);
+  ensureSheet(ss, SHEET_NAME.sources, HEADERS.sources);
+  ensureSheet(ss, SHEET_NAME.apps, HEADERS.apps);
+  ensureSheet(ss, SHEET_NAME.rules, HEADERS.rules);
+  ensureSheet(ss, SHEET_NAME.updates, HEADERS.updates);
+  ensureSheet(ss, SHEET_NAME.judgments, HEADERS.judgments);
+  ensureSheet(ss, SHEET_NAME.seen, HEADERS.seen);
+  ensureSheet(ss, SHEET_NAME.log, HEADERS.log);
+}
+
 function ensureSheet(ss, name, headers) {
   let sheet = ss.getSheetByName(name);
   if (!sheet) sheet = ss.insertSheet(name);
-  const current = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
-  const blank = current.every(function (cell) { return String(cell || "").trim() === ""; });
+  const width = Math.max(sheet.getLastColumn(), headers.length, 1);
+  const current = sheet.getRange(1, 1, 1, width).getValues()[0].map(function (cell) {
+    return String(cell || "").trim();
+  });
+  const blank = current.every(function (cell) { return cell === ""; });
   if (blank) {
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     sheet.setFrozenRows(1);
     sheet.getRange(1, 1, 1, headers.length).setFontWeight("bold");
+    return sheet;
   }
+  const present = {};
+  let col = 0;
+  current.forEach(function (cell, index) {
+    if (!cell) return;
+    present[cell] = true;
+    col = index + 1;
+  });
+  headers.forEach(function (header) {
+    if (present[header]) return;
+    col += 1;
+    sheet.getRange(1, col).setValue(header).setFontWeight("bold");
+    present[header] = true;
+  });
+  if (sheet.getFrozenRows() < 1) sheet.setFrozenRows(1);
   return sheet;
 }
 
@@ -488,6 +526,12 @@ function headerList(sheet) {
   return sheet.getRange(1, 1, 1, width).getValues()[0].map(function (cell) {
     return String(cell || "").trim();
   });
+}
+
+function logLine(ss, level, message) {
+  const sheet = ss && ss.getSheetByName(SHEET_NAME.log);
+  if (!sheet) return;
+  sheet.appendRow([nowText(), level, String(message || "")]);
 }
 
 function appendObjects(sheet, objects) {
@@ -614,13 +658,15 @@ function fetchText(url) {
   return response.getContentText() || "";
 }
 
-function postSlack(webhookUrl, text) {
+function postSlack(webhookUrl, text, blocks) {
   if (!webhookReady(webhookUrl)) throw new Error("Slack Webhook URL が Incoming Webhook の形ではありません。");
+  const payload = { text: text };
+  if (blocks && blocks.length) payload.blocks = blocks;
   const response = UrlFetchApp.fetch(String(webhookUrl).trim(), {
     method: "post",
     contentType: "application/json",
     muteHttpExceptions: true,
-    payload: JSON.stringify({ text: text })
+    payload: JSON.stringify(payload)
   });
   const code = response.getResponseCode();
   if (code < 200 || code >= 300) {
